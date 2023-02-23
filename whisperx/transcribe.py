@@ -567,6 +567,60 @@ def post_process_results(
 
     return output
 
+def custom_transcribe(
+    model: "Whisper",
+    audio: Union[str, np.ndarray, torch.Tensor],
+    *,
+    device: str = "cpu",
+    language: str = None,
+    # alignment params
+    align_model: str = None,
+    align_extend: float = 2,
+    align_from_prev: bool = True,
+    interpolate_method: str = "nearest",
+    # Hugging Face Token
+    hf_token: str = None,
+    # Diarize
+    diarize: bool = True,
+    min_speakers: int = None,
+    max_speakers: int = None
+):
+    diarize_pipeline = None
+    if diarize:
+        if hf_token is None:
+            print("Warning, no --hf_token used, needs to be saved in environment variable, otherwise will throw error loading diarization model...")
+        from pyannote.audio import Pipeline
+        diarize_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization@2.1",
+                                    use_auth_token=hf_token)
+
+    align_language = language if language is not None else "en" # default to loading english if not specified
+    align_model, align_metadata = load_align_model(align_language, device, model_name=align_model)
+
+    print("Performing transcription...")
+    result = transcribe(model, audio)
+
+    if result["language"] != align_metadata["language"]:
+        # load new language
+        print(f"New language found ({result['language']})! Previous was ({align_metadata['language']}), loading new alignment model for new language...")
+        align_model, align_metadata = load_align_model(result["language"], device)
+
+
+    print("Performing alignment...")
+    result_aligned = align(result["segments"], align_model, align_metadata, audio, device,
+                            extend_duration=align_extend, start_from_previous=align_from_prev, interpolate_method=interpolate_method)
+
+    if diarize:
+        print("Performing diarization...")
+        diarize_segments = diarize_pipeline(audio, min_speakers=min_speakers, max_speakers=max_speakers)
+        diarize_df = pd.DataFrame(diarize_segments.itertracks(yield_label=True))
+        diarize_df['start'] = diarize_df[0].apply(lambda x: x.start)
+        diarize_df['end'] = diarize_df[0].apply(lambda x: x.end)
+        # assumes each utterance is single speaker (needs fix)
+        result_segments, word_segments = assign_word_speakers(diarize_df, result_aligned["segments"], fill_nearest=True)
+        result_aligned["segments"] = result_segments
+        result_aligned["word_segments"] = word_segments
+
+    return result_aligned
 
 def cli():
     from . import available_models
